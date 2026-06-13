@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime as dt, timedelta
+from datetime import datetime as dt, timezone, timedelta
 from fastapi import FastAPI, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -39,9 +39,13 @@ class TelemetryInput(BaseModel):
     presence: bool
 
 class TelemetryDB(TelemetryInput):
-    # UUID removed; let MongoDB handle unique _id natively.
-    
-    datetime: dt = Field(default_factory=lambda: dt.now().replace(microsecond=0))
+    # Enforced UTC aware-to-naive standardization:
+    # 1. dt.now(timezone.utc) generates a strict timezone-aware UTC timestamp.
+    # 2. replace(tzinfo=None) strips the timezone signature to maintain naive format compatibility.
+    # 3. replace(microsecond=0) cleans the trailing fractional seconds.
+    datetime: dt = Field(
+        default_factory=lambda: dt.now(timezone.utc).replace(tzinfo=None).replace(microsecond=0)
+    )
 
 class SettingsInput(BaseModel):
     user_temp: float
@@ -57,15 +61,19 @@ class SettingsDB(SettingsInput):
 @app.post("/data", status_code=status.HTTP_201_CREATED)
 async def ingest_telemetry(payload: TelemetryInput):
     db_payload = TelemetryDB(**payload.model_dump())
-    
-    # Standard dump ensures datetime remains a Python native type 
-    # so Motor stores it as a proper BSON Date in MongoDB.
+
+    # Standard dump ensures datetime remains a Python native type
+    # so Motor stores it as a proper BSON Date in MongoDB[cite: 10].
     document = db_payload.model_dump()
+    
+    # Asynchronously insert into MongoDB[cite: 10, 11, 12].
     await data_collection.insert_one(document)
-    
-    # Remove _id before returning to client
+
+    # THE FIX: Pop the mutated BSON '_id' from the dictionary in RAM[cite: 2, 8].
+    # Passing None prevents a KeyError if '_id' is missing[cite: 8].
     document.pop("_id", None)
-    
+
+    # Return the sanitized dictionary safely to the client[cite: 8].
     return document
 
 # ==========================================
@@ -74,15 +82,15 @@ async def ingest_telemetry(payload: TelemetryInput):
 @app.put("/settings", status_code=status.HTTP_200_OK)
 async def update_settings(payload: SettingsInput):
     # 1. Regex parsing algorithm for time duration
-    pattern = r"(\d+(?:\.\d)?)([smhd])"
+    pattern = r"(\d+(?:\.\d+)?)([smhd])"
     matches = re.findall(pattern, payload.light_duration)
-    
+
     if not matches:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="Invalid light_duration format. Use formats like '4h', '2h30m'."
         )
-    
+
     multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     total_seconds = sum(float(val) * multipliers[unit] for val, unit in matches)
 
@@ -93,19 +101,20 @@ async def update_settings(payload: SettingsInput):
         light_time_off = end_time.strftime("%H:%M:%S")
     except ValueError:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="Invalid user_light format. Must be HH:MM:SS."
         )
 
-    # 3. Singleton Database Update
+    # 3. Singleton Database Update (wipes and replaces)
     db_settings = SettingsDB(**payload.model_dump(), light_time_off=light_time_off)
     document = db_settings.model_dump()
     await settings_collection.replace_one({}, document, upsert=True)
-    
-    # 4. Clean up response to perfectly match rubric expected shape
+
+    # 4. Clean up response to perfectly match expected shape
+    # Applying the Pop Mutation Pattern here as well to prevent leaks
     document.pop("_id", None)
     document.pop("light_duration", None)
-    
+
     return document
 
 # ==========================================
@@ -113,31 +122,36 @@ async def update_settings(payload: SettingsInput):
 # ==========================================
 @app.get("/state", status_code=status.HTTP_200_OK)
 async def get_state():
-    # 1. Fetch system state
+    # 1. Fetch system configurations and the latest sensor telemetry asynchronously
     settings = await settings_collection.find_one({})
-    recent_data = await data_collection.find_one(sort=[("datetime", -1)])
-    
-    # Safe fallback: If DB is empty, default to OFF.
-    # Prevents throwing a 404 which could crash the ESP32 JSON parser on boot.
+    recent_data = await data_collection.find_one({}, sort=[("datetime", -1)])
+
+    # 2. DEFENSIVE GUARD (Cold Boot Safe-Harbor)
+    # If the database is empty, return a safe default to protect the hardware
     if not settings or not recent_data:
         return {"fan": False, "light": False}
 
-    # 2. FAN LOGIC: temp > user_temp AND presence == True
+    # 3. Evaluate Fan Actuation Logic (Thermodynamic Rule)
     fan_on = (recent_data["temperature"] > settings["user_temp"]) and recent_data["presence"]
 
-    # 3. LIGHT LOGIC: current time in window AND presence == True
-    current_time_str = dt.now().strftime("%H:%M:%S")
-    start = settings["user_light"]
-    end = settings["light_time_off"]
+    # 4. Evaluate Light Actuation Logic (Temporal Rule with Midnight Wrapping)
+    # Grab current server-side UTC time formatted strictly to HH:MM:SS
+    current_time_str = dt.now(timezone.utc).strftime("%H:%M:%S")
+    
+    start = settings["user_light"]       # Stored as UTC string "HH:MM:SS"
+    end = settings["light_time_off"]     # Calculated as UTC string "HH:MM:SS"
 
-    # Handle time wrapping over midnight
+    # Handle Time Wrapping Over Midnight
     if start <= end:
+        # Standard linear window (does not cross midnight)
         in_time_window = start <= current_time_str <= end
     else:
+        # Midnight-wrapping window (crosses midnight)
         in_time_window = current_time_str >= start or current_time_str <= end
-        
+
     light_on = in_time_window and recent_data["presence"]
 
+    # 5. Return the calculated actuator state payload back to the ESP32
     return {"fan": fan_on, "light": light_on}
 
 # ==========================================
@@ -145,11 +159,14 @@ async def get_state():
 # ==========================================
 @app.get("/graph", status_code=status.HTTP_200_OK)
 async def get_graph(size: int = Query(default=10, ge=1)):
-    # 1. Fetch 'size' recent documents, sorted descending
+    # Apply Query Projection {"_id": 0} to command the database engine 
+    # to strip the _id key prior to network transmission.
     cursor = data_collection.find({}, {"_id": 0}).sort("datetime", -1).limit(size)
+    
+    # Asynchronously convert the cursor to a list of dictionaries
     documents = await cursor.to_list(length=size)
     
-    # 2. Reverse array to chronological order (oldest -> newest for graphs)
+    # Restore chronological ordering for front-end React chart rendering
     documents.reverse()
-    
+
     return documents
